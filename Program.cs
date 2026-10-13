@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using PIITH;
 using System.Globalization;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
@@ -17,6 +18,8 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<PiithDb>();
     await db.Database.EnsureCreatedAsync();
+    // Atualiza bancos já existentes sem apagar dados da demonstração.
+    await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"PreFichas\" ADD COLUMN IF NOT EXISTS \"IntakeAnswers\" text NOT NULL DEFAULT '{}';");
     if (!await db.Doctors.AnyAsync())
     {
         db.Doctors.AddRange(
@@ -68,6 +71,7 @@ app.MapPost("/api/prefichas", async (CreatePreFicha input, PiithDb db) =>
         Symptoms = input.Symptoms.Trim(),
         Duration = string.IsNullOrWhiteSpace(input.Duration) ? "Não informado" : input.Duration.Trim(),
         PainLevel = Math.Clamp(input.PainLevel, 0, 10),
+        IntakeAnswers = JsonSerializer.Serialize(input.Answers ?? new Dictionary<string, string>()),
         CreatedAt = DateTime.UtcNow,
         Status = "Aguardando avaliação",
         Priority = "A definir pela atendente"
@@ -211,6 +215,7 @@ namespace PIITH
             modelBuilder.Entity<PreFicha>().HasIndex(p => p.Protocol).IsUnique();
             modelBuilder.Entity<PreFicha>().Property(p => p.PatientName).HasMaxLength(120);
             modelBuilder.Entity<PreFicha>().Property(p => p.Symptoms).HasMaxLength(1200);
+            modelBuilder.Entity<PreFicha>().Property(p => p.IntakeAnswers).HasColumnType("text");
             modelBuilder.Entity<Doctor>().Property(d => d.Name).HasMaxLength(120);
         }
     }
@@ -223,6 +228,7 @@ namespace PIITH
         public string Symptoms { get; set; } = "";
         public string Duration { get; set; } = "";
         public int PainLevel { get; set; }
+        public string IntakeAnswers { get; set; } = "{}";
         public string Priority { get; set; } = "A definir pela atendente";
         public string Status { get; set; } = "Aguardando avaliação";
         public int? DoctorId { get; set; }
@@ -245,7 +251,7 @@ namespace PIITH
         public string Action { get; set; } = "";
         public DateTime RecordedAt { get; set; }
     }
-    public record CreatePreFicha(string PatientName, string Symptoms, string? Duration, int PainLevel);
+    public record CreatePreFicha(string PatientName, string Symptoms, string? Duration, int PainLevel, Dictionary<string, string>? Answers = null);
     public record UpdatePreFicha(string PatientName, string Symptoms, string? Duration, int PainLevel);
     public record UpdatePreFichaStatus(string Status);
     public record UpdatePriority(string Priority);
