@@ -34,10 +34,17 @@ app.MapGet("/api/dashboard", async (PiithDb db) =>
 {
     var patients = await db.PreFichas.OrderByDescending(p => p.CreatedAt).ToListAsync();
     var doctors = await db.Doctors.OrderBy(d => d.Name).ToListAsync();
+    var pointRecords = await db.PointRecords
+        .OrderByDescending(r => r.RecordedAt)
+        .Take(30)
+        .Join(db.Doctors, r => r.DoctorId, d => d.Id,
+            (r, d) => new { r.Id, r.Action, r.RecordedAt, DoctorName = d.Name })
+        .ToListAsync();
     return Results.Ok(new
     {
         patients,
         doctors,
+        pointRecords,
         totals = new
         {
             waiting = patients.Count(p => p.Status == "Aguardando avaliação"),
@@ -68,6 +75,56 @@ app.MapPost("/api/prefichas", async (CreatePreFicha input, PiithDb db) =>
     db.PreFichas.Add(ficha);
     await db.SaveChangesAsync();
     return Results.Created($"/api/prefichas/{ficha.Id}", ficha);
+});
+
+app.MapPatch("/api/prefichas/{id:int}", async (int id, UpdatePreFicha input, PiithDb db) =>
+{
+    var ficha = await db.PreFichas.FindAsync(id);
+    if (ficha is null) return Results.NotFound(new { message = "Pré-ficha não encontrada." });
+    if (string.IsNullOrWhiteSpace(input.PatientName) || input.PatientName.Trim().Length < 2)
+        return Results.BadRequest(new { message = "Informe um nome válido." });
+    if (string.IsNullOrWhiteSpace(input.Symptoms))
+        return Results.BadRequest(new { message = "Informe os sintomas." });
+
+    ficha.PatientName = input.PatientName.Trim();
+    ficha.Symptoms = input.Symptoms.Trim();
+    ficha.Duration = string.IsNullOrWhiteSpace(input.Duration) ? "Não informado" : input.Duration.Trim();
+    ficha.PainLevel = Math.Clamp(input.PainLevel, 0, 10);
+    ficha.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+    return Results.Ok(ficha);
+});
+
+app.MapPatch("/api/prefichas/{id:int}/status", async (int id, UpdatePreFichaStatus input, PiithDb db) =>
+{
+    var ficha = await db.PreFichas.FindAsync(id);
+    if (ficha is null) return Results.NotFound(new { message = "Pré-ficha não encontrada." });
+
+    var allowed = new[] { "Aguardando avaliação", "Encaminhado", "Em atendimento", "Concluído", "Cancelado" };
+    if (!allowed.Contains(input.Status))
+        return Results.BadRequest(new { message = "Estado de atendimento inválido." });
+
+    var previousStatus = ficha.Status;
+    ficha.Status = input.Status;
+    ficha.UpdatedAt = DateTime.UtcNow;
+
+    if (ficha.DoctorId is int doctorId)
+    {
+        var doctor = await db.Doctors.FindAsync(doctorId);
+        if (doctor is not null && input.Status == "Concluído")
+        {
+            doctor.Status = "Disponível";
+            doctor.LastReleasedAt = DateTime.UtcNow;
+        }
+        else if (doctor is not null && input.Status == "Cancelado" && previousStatus is "Encaminhado" or "Em atendimento")
+        {
+            doctor.Status = "Disponível";
+            doctor.LastReleasedAt = DateTime.UtcNow;
+        }
+    }
+
+    await db.SaveChangesAsync();
+    return Results.Ok(ficha);
 });
 
 app.MapPatch("/api/prefichas/{id:int}/priority", async (int id, UpdatePriority input, PiithDb db) =>
@@ -189,6 +246,8 @@ namespace PIITH
         public DateTime RecordedAt { get; set; }
     }
     public record CreatePreFicha(string PatientName, string Symptoms, string? Duration, int PainLevel);
+    public record UpdatePreFicha(string PatientName, string Symptoms, string? Duration, int PainLevel);
+    public record UpdatePreFichaStatus(string Status);
     public record UpdatePriority(string Priority);
     public record AssignDoctor(int DoctorId);
     public record PointRequest(string Action);
