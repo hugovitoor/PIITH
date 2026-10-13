@@ -26,7 +26,7 @@ Abra a URL indicada no terminal. Para PostgreSQL local, o fallback de desenvolvi
 
 O banco é inicializado com `EnsureCreated` para facilitar a demonstração. Antes de evolução para produção, substituir por migrations EF Core e configurar backup, autenticação, autorização, monitoramento e migrações controladas.
 
-## Endpoints iniciais
+## Endpoints iniciais.
 - `GET /api/health`
 - `GET /api/dashboard`
 - `POST /api/prefichas`
