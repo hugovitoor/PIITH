@@ -84,12 +84,22 @@ using (var scope = app.Services.CreateScope())
     if (!await db.Doctors.AnyAsync())
     {
         db.Doctors.AddRange(
-            new Doctor { Name = "Dra. Marina Costa", Specialty = "Clínica geral", Status = "Disponível", LastReleasedAt = DateTime.UtcNow.AddMinutes(-18) },
-            new Doctor { Name = "Dr. Rafael Santos", Specialty = "Clínica geral", Status = "Ocupado", LastReleasedAt = DateTime.UtcNow.AddMinutes(-4) },
-            new Doctor { Name = "Dra. Camila Alves", Specialty = "Clínica geral", Status = "Indeterminado", LastReleasedAt = DateTime.UtcNow.AddMinutes(-32) }
+            new Doctor { Name = "Dra. Marina Costa", Specialty = "Clínica geral", Status = "Fora de serviço", LastReleasedAt = DateTime.UtcNow.AddMinutes(-18) },
+            new Doctor { Name = "Dr. Rafael Santos", Specialty = "Clínica geral", Status = "Fora de serviço", LastReleasedAt = DateTime.UtcNow.AddMinutes(-4) },
+            new Doctor { Name = "Dra. Camila Alves", Specialty = "Clínica geral", Status = "Fora de serviço", LastReleasedAt = DateTime.UtcNow.AddMinutes(-32) }
         );
         await db.SaveChangesAsync();
     }
+    // Bootstrap de demonstração: se o banco ainda não tem ponto, cria uma entrada inicial para cada profissional.
+    if (!await db.PointRecords.AnyAsync())
+    {
+        foreach (var doctor in await db.Doctors.ToListAsync())
+            db.PointRecords.Add(new PointRecord { DoctorId = doctor.Id, Action = "Entrada", RecordedAt = DateTime.UtcNow.AddHours(-2) });
+        await db.SaveChangesAsync();
+    }
+    foreach (var doctor in await db.Doctors.ToListAsync())
+        await RefreshDoctorStatus(db, doctor);
+    await db.SaveChangesAsync();
 }
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok", app = "PIITH" }));
@@ -174,15 +184,13 @@ app.MapGet("/api/dashboard", async (PiithDb db, HttpContext context) =>
 
 app.MapPost("/api/prefichas", async (CreatePreFicha input, PiithDb db) =>
 {
-    if (string.IsNullOrWhiteSpace(input.PatientName) || input.PatientName.Trim().Length < 2)
-        return Results.BadRequest(new { message = "Informe um nome válido para a demonstração." });
     if (string.IsNullOrWhiteSpace(input.Symptoms))
         return Results.BadRequest(new { message = "Informe os sintomas." });
 
     var ficha = new PreFicha
     {
         Protocol = $"PIITH-{DateTime.UtcNow:yyMMdd}-{Guid.NewGuid().ToString("N")[..5].ToUpperInvariant()}",
-        PatientName = input.PatientName.Trim(),
+        PatientName = string.IsNullOrWhiteSpace(input.PatientName) ? "A identificar" : input.PatientName.Trim(),
         Symptoms = input.Symptoms.Trim(),
         Duration = string.IsNullOrWhiteSpace(input.Duration) ? "Não informado" : input.Duration.Trim(),
         PainLevel = Math.Clamp(input.PainLevel, 0, 10),
@@ -200,12 +208,10 @@ app.MapPatch("/api/prefichas/{id:int}", async (int id, UpdatePreFicha input, Pii
 {
     var ficha = await db.PreFichas.FindAsync(id);
     if (ficha is null) return Results.NotFound(new { message = "Pré-ficha não encontrada." });
-    if (string.IsNullOrWhiteSpace(input.PatientName) || input.PatientName.Trim().Length < 2)
-        return Results.BadRequest(new { message = "Informe um nome válido." });
     if (string.IsNullOrWhiteSpace(input.Symptoms))
         return Results.BadRequest(new { message = "Informe os sintomas." });
 
-    ficha.PatientName = input.PatientName.Trim();
+    ficha.PatientName = string.IsNullOrWhiteSpace(input.PatientName) ? "A identificar" : input.PatientName.Trim();
     ficha.Symptoms = input.Symptoms.Trim();
     ficha.Duration = string.IsNullOrWhiteSpace(input.Duration) ? "Não informado" : input.Duration.Trim();
     ficha.PainLevel = Math.Clamp(input.PainLevel, 0, 10);
@@ -224,25 +230,27 @@ app.MapPatch("/api/prefichas/{id:int}/status", async (int id, UpdatePreFichaStat
         return Results.BadRequest(new { message = "Estado de atendimento inválido." });
 
     var previousStatus = ficha.Status;
-    ficha.Status = input.Status;
-    ficha.UpdatedAt = DateTime.UtcNow;
+    if (input.Status == "Em atendimento" && ficha.DoctorId is null)
+        return Results.BadRequest(new { message = "Encaminhe a ficha para um profissional antes de iniciar o atendimento." });
 
-    if (ficha.DoctorId is int doctorId)
+    Doctor? assignedDoctor = ficha.DoctorId is int assignedId ? await db.Doctors.FindAsync(assignedId) : null;
+    if (input.Status == "Em atendimento" && assignedDoctor is not null)
     {
-        var doctor = await db.Doctors.FindAsync(doctorId);
-        if (doctor is not null && input.Status == "Concluído")
-        {
-            doctor.Status = "Disponível";
-            doctor.LastReleasedAt = DateTime.UtcNow;
-        }
-        else if (doctor is not null && input.Status == "Cancelado" && previousStatus is "Encaminhado" or "Em atendimento")
-        {
-            doctor.Status = "Disponível";
-            doctor.LastReleasedAt = DateTime.UtcNow;
-        }
+        var latestPoint = await db.PointRecords.Where(r => r.DoctorId == assignedDoctor.Id).OrderByDescending(r => r.RecordedAt).FirstOrDefaultAsync();
+        if (latestPoint?.Action != "Entrada")
+            return Results.BadRequest(new { message = "O profissional não está registrado como presente no hospital." });
+        var otherActive = await db.PreFichas.AnyAsync(p => p.Id != ficha.Id && p.DoctorId == assignedDoctor.Id && p.Status == "Em atendimento");
+        if (otherActive) return Results.BadRequest(new { message = "Este profissional já está em outro atendimento." });
     }
 
+    ficha.Status = input.Status;
+    ficha.UpdatedAt = DateTime.UtcNow;
     await db.SaveChangesAsync();
+    if (assignedDoctor is not null)
+    {
+        await RefreshDoctorStatus(db, assignedDoctor);
+        await db.SaveChangesAsync();
+    }
     return Results.Ok(ficha);
 });
 
@@ -264,12 +272,15 @@ app.MapPatch("/api/prefichas/{id:int}/assign", async (int id, AssignDoctor input
     if (ficha is null) return Results.NotFound(new { message = "Pré-ficha não encontrada." });
     var doctor = await db.Doctors.FindAsync(input.DoctorId);
     if (doctor is null) return Results.NotFound(new { message = "Profissional não encontrado." });
-    if (doctor.Status != "Disponível") return Results.BadRequest(new { message = "Este profissional não está marcado como disponível." });
+    var latestPoint = await db.PointRecords.Where(r => r.DoctorId == doctor.Id).OrderByDescending(r => r.RecordedAt).FirstOrDefaultAsync();
+    if (latestPoint?.Action != "Entrada") return Results.BadRequest(new { message = "O profissional não registrou entrada no hospital." });
+    if (doctor.Status == "Ocupado") return Results.BadRequest(new { message = "Este profissional já está em atendimento." });
+    var alreadyAssigned = await db.PreFichas.AnyAsync(p => p.Id != ficha.Id && p.DoctorId == doctor.Id && (p.Status == "Encaminhado" || p.Status == "Em atendimento"));
+    if (alreadyAssigned) return Results.BadRequest(new { message = "Este profissional já possui uma ficha encaminhada ou em atendimento." });
     ficha.DoctorId = doctor.Id;
     ficha.DoctorName = doctor.Name;
     ficha.Status = "Encaminhado";
     ficha.UpdatedAt = DateTime.UtcNow;
-    doctor.Status = "Ocupado";
     await db.SaveChangesAsync();
     return Results.Ok(ficha);
 });
@@ -281,27 +292,37 @@ app.MapPost("/api/doctors/{id:int}/point", async (int id, PointRequest input, Pi
     var doctor = await db.Doctors.FindAsync(id);
     if (doctor is null) return Results.NotFound(new { message = "Profissional não encontrado." });
     var action = input.Action?.Trim().ToLowerInvariant();
-    if (action is not ("entrada" or "saida")) return Results.BadRequest(new { message = "Ação deve ser entrada ou saida." });
+    if (action is not ("entrada" or "saida")) return Results.BadRequest(new { message = "Ação deve ser entrada ou saída." });
+    var latestPoint = await db.PointRecords.Where(r => r.DoctorId == id).OrderByDescending(r => r.RecordedAt).FirstOrDefaultAsync();
+    var isOnDuty = latestPoint?.Action == "Entrada";
+    if (action == "entrada" && isOnDuty) return Results.BadRequest(new { message = "A entrada já está registrada. Registre a saída antes de uma nova entrada." });
+    if (action == "saida" && !isOnDuty) return Results.BadRequest(new { message = "Não há uma jornada aberta para registrar saída." });
+    if (action == "saida")
+    {
+        var hasActiveFicha = await db.PreFichas.AnyAsync(p => p.DoctorId == id && (p.Status == "Encaminhado" || p.Status == "Em atendimento"));
+        if (hasActiveFicha) return Results.BadRequest(new { message = "Conclua ou reorganize a ficha encaminhada antes de registrar a saída." });
+    }
     db.PointRecords.Add(new PointRecord { DoctorId = id, Action = action == "entrada" ? "Entrada" : "Saída", RecordedAt = DateTime.UtcNow });
-    doctor.Status = action == "entrada" ? "Indeterminado" : "Fora de serviço";
     await db.SaveChangesAsync();
-    return Results.Ok(new { message = $"{doctor.Name}: { (action == "entrada" ? "entrada" : "saída") } registrada." });
-});
-
-app.MapPatch("/api/doctors/{id:int}/status", async (int id, UpdateDoctorStatus input, PiithDb db) =>
-{
-    var doctor = await db.Doctors.FindAsync(id);
-    if (doctor is null) return Results.NotFound(new { message = "Profissional não encontrado." });
-    var allowed = new[] { "Disponível", "Ocupado", "Indeterminado", "Fora de serviço" };
-    if (!allowed.Contains(input.Status)) return Results.BadRequest(new { message = "Estado inválido." });
-    if (doctor.Status == "Ocupado" && input.Status == "Disponível") doctor.LastReleasedAt = DateTime.UtcNow;
-    doctor.Status = input.Status;
+    await RefreshDoctorStatus(db, doctor);
     await db.SaveChangesAsync();
-    return Results.Ok(doctor);
+    return Results.Ok(new { message = $"{doctor.Name}: { (action == "entrada" ? "entrada" : "saída") } registrada. Estado atualizado automaticamente: {doctor.Status}." });
 });
 
 app.MapFallbackToFile("index.html");
 app.Run();
+
+static async Task RefreshDoctorStatus(PiithDb db, Doctor doctor)
+{
+    var previousStatus = doctor.Status;
+    var latestPoint = await db.PointRecords.Where(r => r.DoctorId == doctor.Id)
+        .OrderByDescending(r => r.RecordedAt).FirstOrDefaultAsync();
+    var presentAtHospital = latestPoint?.Action == "Entrada";
+    var attendingPatient = await db.PreFichas.AnyAsync(p => p.DoctorId == doctor.Id && p.Status == "Em atendimento");
+    doctor.Status = !presentAtHospital ? "Fora de serviço" : attendingPatient ? "Ocupado" : "Disponível";
+    if (doctor.Status == "Disponível" && previousStatus != "Disponível")
+        doctor.LastReleasedAt = DateTime.UtcNow;
+}
 
 static string GetConnectionString(IConfiguration config)
 {
@@ -375,5 +396,4 @@ namespace PIITH
     public record UpdatePriority(string Priority);
     public record AssignDoctor(int DoctorId);
     public record PointRequest(string Action);
-    public record UpdateDoctorStatus(string Status);
 }
