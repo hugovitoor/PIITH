@@ -80,7 +80,7 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<PiithDb>();
     await db.Database.EnsureCreatedAsync();
     // Atualiza bancos já existentes sem apagar dados da demonstração.
-    await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"PreFichas\" ADD COLUMN IF NOT EXISTS \"IntakeAnswers\" text NOT NULL DEFAULT '{}';");
+    await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"PreFichas\" ADD COLUMN IF NOT EXISTS \"IntakeAnswers\" text NOT NULL DEFAULT '{{}}';");
     if (!await db.Doctors.AnyAsync())
     {
         db.Doctors.AddRange(
