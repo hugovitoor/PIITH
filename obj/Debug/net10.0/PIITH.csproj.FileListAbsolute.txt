@@ -163,7 +163,6 @@ C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\rjimswa.dswa.cach
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\rjsmrazor.dswa.cache.json
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\rjsmcshtml.dswa.cache.json
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\scopedcss\bundle\PIITH.styles.css
-C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\compressed\wvi63o4qnu-{0}-9vdcgjur77-9vdcgjur77.gz
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\staticwebassets.build.json
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\staticwebassets.build.json.cache
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\staticwebassets.development.json
@@ -175,3 +174,4 @@ C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\refint\PIITH.dll
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\PIITH.pdb
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\PIITH.genruntimeconfig.cache
 C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\ref\PIITH.dll
+C:\Users\fvito\Downloads\Programação\PIITH\obj\Debug\net10.0\compressed\wvi63o4qnu-{0}-ejt3jhbk6l-ejt3jhbk6l.gz

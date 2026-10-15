@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("PIITH")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+758b220cf9f1cfa67fdbd7f7d083bf192d4fbfaf")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5667e7920c4807d71a6d4e8ceb5b26416026da94")]
 [assembly: System.Reflection.AssemblyProductAttribute("PIITH")]
 [assembly: System.Reflection.AssemblyTitleAttribute("PIITH")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

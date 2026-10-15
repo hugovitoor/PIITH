@@ -225,7 +225,7 @@ app.MapPatch("/api/prefichas/{id:int}/status", async (int id, UpdatePreFichaStat
     var ficha = await db.PreFichas.FindAsync(id);
     if (ficha is null) return Results.NotFound(new { message = "Pré-ficha não encontrada." });
 
-    var allowed = new[] { "Aguardando avaliação", "Encaminhado", "Em atendimento", "Concluído", "Cancelado" };
+    var allowed = new[] { "Aguardando avaliação", "Encaminhado", "Em atendimento", "Concluído", "Cancelado", "Arquivado" };
     if (!allowed.Contains(input.Status))
         return Results.BadRequest(new { message = "Estado de atendimento inválido." });
 
