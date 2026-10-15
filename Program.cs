@@ -1,4 +1,7 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using System.Security.Claims;
 using PIITH;
 using System.Globalization;
 using System.Text.Json;
@@ -8,18 +11,76 @@ var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 var connectionString = GetConnectionString(builder.Configuration);
 builder.Services.AddDbContext<PiithDb>(options => options.UseNpgsql(connectionString));
+builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie(options =>
+{
+    options.Cookie.Name = "PIITH.Auth";
+    options.Cookie.HttpOnly = true;
+    options.Cookie.SameSite = SameSiteMode.Lax;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    options.ExpireTimeSpan = TimeSpan.FromHours(8);
+    options.SlidingExpiration = true;
+    options.Events.OnRedirectToLogin = context => { context.Response.StatusCode = StatusCodes.Status401Unauthorized; return Task.CompletedTask; };
+    options.Events.OnRedirectToAccessDenied = context => { context.Response.StatusCode = StatusCodes.Status403Forbidden; return Task.CompletedTask; };
+});
+builder.Services.AddAuthorization();
 
 var app = builder.Build();
 app.UseDefaultFiles();
 app.UseStaticFiles();
+app.UseAuthentication();
+app.UseAuthorization();
 
-// Protótipo de demonstração: use somente dados fictícios até adicionar autenticação e controles LGPD.
+// Proteção dos endpoints da API por perfil. As contas abaixo são exclusivamente demonstrativas.
+app.Use(async (context, next) =>
+{
+    var path = context.Request.Path;
+    if (!path.StartsWithSegments("/api") || path.StartsWithSegments("/api/health") ||
+        path.StartsWithSegments("/api/auth/login") || path.StartsWithSegments("/api/auth/me") ||
+        path.StartsWithSegments("/api/auth/logout"))
+    {
+        await next();
+        return;
+    }
+
+    if (context.User.Identity?.IsAuthenticated != true)
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        await context.Response.WriteAsJsonAsync(new { message = "Faça login para continuar." });
+        return;
+    }
+
+    var role = context.User.FindFirst(ClaimTypes.Role)?.Value ?? "";
+    var method = context.Request.Method;
+    var isAssistantOnly = (method == "PATCH" && path.StartsWithSegments("/api/prefichas")) ||
+                          (method == "PATCH" && path.StartsWithSegments("/api/doctors"));
+    var isPointPost = method == "POST" && path.StartsWithSegments("/api/doctors") && path.Value?.EndsWith("/point", StringComparison.OrdinalIgnoreCase) == true;
+    var isCreateFicha = method == "POST" && path.Equals("/api/prefichas");
+    var isDashboard = method == "GET" && path.Equals("/api/dashboard");
+
+    var allowed = role switch
+    {
+        "assistente" => true,
+        "medico" => isDashboard || isPointPost,
+        "totem" => isCreateFicha,
+        _ => false
+    };
+    if (isAssistantOnly && role != "assistente") allowed = false;
+    if (!allowed)
+    {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        await context.Response.WriteAsJsonAsync(new { message = "Seu perfil não tem permissão para esta ação." });
+        return;
+    }
+    await next();
+});
+
+// Protótipo acadêmico: as contas/senhas são de demonstração, não use dados reais de pacientes.
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<PiithDb>();
     await db.Database.EnsureCreatedAsync();
     // Atualiza bancos já existentes sem apagar dados da demonstração.
-    await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"PreFichas\" ADD COLUMN IF NOT EXISTS \"IntakeAnswers\" text NOT NULL DEFAULT '{{}}';");
+    await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"PreFichas\" ADD COLUMN IF NOT EXISTS \"IntakeAnswers\" text NOT NULL DEFAULT '{}';");
     if (!await db.Doctors.AnyAsync())
     {
         db.Doctors.AddRange(
@@ -33,13 +94,67 @@ using (var scope = app.Services.CreateScope())
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok", app = "PIITH" }));
 
-app.MapGet("/api/dashboard", async (PiithDb db) =>
+app.MapPost("/api/auth/login", async (LoginRequest input, HttpContext context, PiithDb db) =>
 {
-    var patients = await db.PreFichas.OrderByDescending(p => p.CreatedAt).ToListAsync();
-    var doctors = await db.Doctors.OrderBy(d => d.Name).ToListAsync();
-    var pointRecords = await db.PointRecords
+    var username = input.Username?.Trim().ToLowerInvariant() ?? "";
+    var password = input.Password ?? "";
+    (string Name, string Role, int? DoctorId)? account = username switch
+    {
+        "assistente" when password == "1234" => (Name: "Assistente PIITH", Role: "assistente", DoctorId: (int?)null),
+        "medico" when password == "1234" => (Name: "Profissional de saúde", Role: "medico", DoctorId: (int?)null),
+        "totem" when password == "1234" => (Name: "Totem do paciente", Role: "totem", DoctorId: (int?)null),
+        _ => ((string Name, string Role, int? DoctorId)?)null
+    };
+    if (account is null) return Results.Unauthorized();
+    if (account.Value.Role == "medico")
+    {
+        var firstDoctor = await db.Doctors.OrderBy(d => d.Id).FirstOrDefaultAsync();
+        if (firstDoctor is null) return Results.Problem("Nenhum profissional foi cadastrado.", statusCode: 500);
+        account = (firstDoctor.Name, "medico", (int?)firstDoctor.Id);
+    }
+
+    var claims = new List<Claim>
+    {
+        new(ClaimTypes.Name, account.Value.Name),
+        new(ClaimTypes.NameIdentifier, username),
+        new(ClaimTypes.Role, account.Value.Role)
+    };
+    if (account.Value.DoctorId is int doctorId) claims.Add(new Claim("doctorId", doctorId.ToString(CultureInfo.InvariantCulture)));
+    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+    await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
+    return Results.Ok(new { username, name = account.Value.Name, role = account.Value.Role, doctorId = account.Value.DoctorId });
+});
+
+app.MapGet("/api/auth/me", (HttpContext context) =>
+{
+    if (context.User.Identity?.IsAuthenticated != true) return Results.Unauthorized();
+    var doctorId = int.TryParse(context.User.FindFirst("doctorId")?.Value, out var id) ? id : (int?)null;
+    return Results.Ok(new { username = context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value, name = context.User.Identity.Name, role = context.User.FindFirst(ClaimTypes.Role)?.Value, doctorId });
+});
+app.MapPost("/api/auth/logout", async (HttpContext context) =>
+{
+    await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    return Results.Ok(new { message = "Sessão encerrada." });
+});
+
+app.MapGet("/api/dashboard", async (PiithDb db, HttpContext context) =>
+{
+    var role = context.User.FindFirst(ClaimTypes.Role)?.Value;
+    var doctorId = int.TryParse(context.User.FindFirst("doctorId")?.Value, out var parsedDoctorId) ? parsedDoctorId : (int?)null;
+    var patientsQuery = db.PreFichas.AsQueryable();
+    var doctorsQuery = db.Doctors.AsQueryable();
+    var recordsQuery = db.PointRecords.AsQueryable();
+    if (role == "medico" && doctorId is int ownId)
+    {
+        patientsQuery = patientsQuery.Where(p => p.DoctorId == ownId);
+        doctorsQuery = doctorsQuery.Where(d => d.Id == ownId);
+        recordsQuery = recordsQuery.Where(r => r.DoctorId == ownId);
+    }
+    var patients = await patientsQuery.OrderByDescending(p => p.CreatedAt).ToListAsync();
+    var doctors = await doctorsQuery.OrderBy(d => d.Name).ToListAsync();
+    var pointRecords = await recordsQuery
         .OrderByDescending(r => r.RecordedAt)
-        .Take(30)
+        .Take(2000)
         .Join(db.Doctors, r => r.DoctorId, d => d.Id,
             (r, d) => new { r.Id, r.Action, r.RecordedAt, DoctorName = d.Name })
         .ToListAsync();
@@ -159,8 +274,10 @@ app.MapPatch("/api/prefichas/{id:int}/assign", async (int id, AssignDoctor input
     return Results.Ok(ficha);
 });
 
-app.MapPost("/api/doctors/{id:int}/point", async (int id, PointRequest input, PiithDb db) =>
+app.MapPost("/api/doctors/{id:int}/point", async (int id, PointRequest input, PiithDb db, HttpContext context) =>
 {
+    if (!int.TryParse(context.User.FindFirst("doctorId")?.Value, out var ownDoctorId) || ownDoctorId != id)
+        return Results.Forbid();
     var doctor = await db.Doctors.FindAsync(id);
     if (doctor is null) return Results.NotFound(new { message = "Profissional não encontrado." });
     var action = input.Action?.Trim().ToLowerInvariant();
@@ -251,6 +368,7 @@ namespace PIITH
         public string Action { get; set; } = "";
         public DateTime RecordedAt { get; set; }
     }
+    public record LoginRequest(string Username, string Password);
     public record CreatePreFicha(string PatientName, string Symptoms, string? Duration, int PainLevel, Dictionary<string, string>? Answers = null);
     public record UpdatePreFicha(string PatientName, string Symptoms, string? Duration, int PainLevel);
     public record UpdatePreFichaStatus(string Status);
