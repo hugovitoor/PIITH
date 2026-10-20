@@ -36,7 +36,7 @@ app.Use(async (context, next) =>
     var path = context.Request.Path;
     if (!path.StartsWithSegments("/api") || path.StartsWithSegments("/api/health") ||
         path.StartsWithSegments("/api/auth/login") || path.StartsWithSegments("/api/auth/me") ||
-        path.StartsWithSegments("/api/auth/logout"))
+        path.StartsWithSegments("/api/auth/logout") || path.StartsWithSegments("/api/cameras/1/agent"))
     {
         await next();
         return;
@@ -81,6 +81,8 @@ using (var scope = app.Services.CreateScope())
     await db.Database.EnsureCreatedAsync();
     // Atualiza bancos já existentes sem apagar dados da demonstração.
     await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"PreFichas\" ADD COLUMN IF NOT EXISTS \"IntakeAnswers\" text NOT NULL DEFAULT '{{}}';");
+    await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"Doctors\" ADD COLUMN IF NOT EXISTS \"RoomPresent\" boolean NULL;");
+    await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"Doctors\" ADD COLUMN IF NOT EXISTS \"RoomPresenceUpdatedAt\" timestamp with time zone NULL;");
     if (!await db.Doctors.AnyAsync())
     {
         db.Doctors.AddRange(
@@ -162,6 +164,8 @@ app.MapGet("/api/dashboard", async (PiithDb db, HttpContext context) =>
     }
     var patients = await patientsQuery.OrderByDescending(p => p.CreatedAt).ToListAsync();
     var doctors = await doctorsQuery.OrderBy(d => d.Name).ToListAsync();
+    foreach (var doctor in doctors) await RefreshDoctorStatus(db, doctor);
+    await db.SaveChangesAsync();
     var pointRecords = await recordsQuery
         .OrderByDescending(r => r.RecordedAt)
         .Take(2000)
@@ -178,8 +182,61 @@ app.MapGet("/api/dashboard", async (PiithDb db, HttpContext context) =>
             waiting = patients.Count(p => p.Status == "Aguardando avaliação"),
             assigned = patients.Count(p => p.Status == "Encaminhado"),
             doctorsOnDuty = doctors.Count(d => d.Status != "Fora de serviço")
-        }
+        },
+        camera = new { id = 1, connected = CameraHub.HasFrame, frameUrl = "/api/cameras/1/frame", updatedAt = CameraHub.LastFrameAt }
     });
+});
+
+// A câmera envia imagens e presença por um token compartilhado. Defina PIITH_CAMERA_TOKEN
+// nas variáveis de ambiente do servidor e no computador que executa o detector.
+app.MapGet("/api/cameras/1/agent/state", async (int doctorId, HttpRequest request, IConfiguration config, PiithDb db) =>
+{
+    if (!ValidCameraToken(request, config)) return Results.Unauthorized();
+    var doctor = await db.Doctors.FindAsync(doctorId);
+    if (doctor is null) return Results.NotFound(new { message = "Profissional não encontrado." });
+    var activeFicha = await db.PreFichas.AnyAsync(p => p.DoctorId == doctorId &&
+        (p.Status == "Encaminhado" || p.Status == "Em atendimento"));
+    return Results.Ok(new { monitoring = !activeFicha, pausedReason = activeFicha ? "Há uma ficha encaminhada ou em atendimento." : null, doctorId });
+});
+
+app.MapPost("/api/cameras/1/agent/frame", async (CameraFrameRequest input, HttpRequest request, IConfiguration config, PiithDb db) =>
+{
+    if (!ValidCameraToken(request, config)) return Results.Unauthorized();
+    if (input.DoctorId <= 0 || string.IsNullOrWhiteSpace(input.ImageBase64))
+        return Results.BadRequest(new { message = "Informe doctorId e imagem." });
+    if (input.ImageBase64.Length > 1_500_000)
+        return Results.BadRequest(new { message = "Imagem muito grande; envie JPEG reduzido." });
+
+    byte[] imageBytes;
+    try { imageBytes = Convert.FromBase64String(input.ImageBase64); }
+    catch (FormatException) { return Results.BadRequest(new { message = "Imagem Base64 inválida." }); }
+    if (imageBytes.Length == 0 || imageBytes.Length > 1_000_000)
+        return Results.BadRequest(new { message = "Tamanho de imagem inválido." });
+
+    var doctor = await db.Doctors.FindAsync(input.DoctorId);
+    if (doctor is null) return Results.NotFound(new { message = "Profissional não encontrado." });
+
+    CameraHub.SetFrame(imageBytes);
+    var hasActiveFicha = await db.PreFichas.AnyAsync(p => p.DoctorId == doctor.Id &&
+        (p.Status == "Encaminhado" || p.Status == "Em atendimento"));
+    // Não aceite estado de presença da IA enquanto houver ficha ativa: a análise deve estar pausada.
+    if (!hasActiveFicha && input.MedicoPresente is bool present)
+    {
+        doctor.RoomPresent = present;
+        doctor.RoomPresenceUpdatedAt = DateTime.UtcNow;
+    }
+    await RefreshDoctorStatus(db, doctor);
+    await db.SaveChangesAsync();
+    return Results.Ok(new { received = true, monitoring = !hasActiveFicha, roomPresent = doctor.RoomPresent, status = doctor.Status });
+});
+
+app.MapGet("/api/cameras/1/frame", (HttpContext context) =>
+{
+    if (!CameraHub.TryGetFrame(out var bytes, out var updatedAt))
+        return Results.NotFound(new { message = "Aguardando a primeira imagem da câmera." });
+    context.Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+    context.Response.Headers["X-Camera-Updated-At"] = updatedAt?.ToString("O") ?? "";
+    return Results.File(bytes, "image/jpeg");
 });
 
 app.MapPost("/api/prefichas", async (CreatePreFicha input, PiithDb db) =>
@@ -274,13 +331,15 @@ app.MapPatch("/api/prefichas/{id:int}/assign", async (int id, AssignDoctor input
     if (doctor is null) return Results.NotFound(new { message = "Profissional não encontrado." });
     var latestPoint = await db.PointRecords.Where(r => r.DoctorId == doctor.Id).OrderByDescending(r => r.RecordedAt).FirstOrDefaultAsync();
     if (latestPoint?.Action != "Entrada") return Results.BadRequest(new { message = "O profissional não registrou entrada no hospital." });
-    if (doctor.Status == "Ocupado") return Results.BadRequest(new { message = "Este profissional já está em atendimento." });
+    if (doctor.Status != "Disponível") return Results.BadRequest(new { message = "O profissional precisa estar confirmado como disponível na sala antes do encaminhamento." });
     var alreadyAssigned = await db.PreFichas.AnyAsync(p => p.Id != ficha.Id && p.DoctorId == doctor.Id && (p.Status == "Encaminhado" || p.Status == "Em atendimento"));
     if (alreadyAssigned) return Results.BadRequest(new { message = "Este profissional já possui uma ficha encaminhada ou em atendimento." });
     ficha.DoctorId = doctor.Id;
     ficha.DoctorName = doctor.Name;
     ficha.Status = "Encaminhado";
     ficha.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+    await RefreshDoctorStatus(db, doctor);
     await db.SaveChangesAsync();
     return Results.Ok(ficha);
 });
@@ -314,14 +373,30 @@ app.Run();
 
 static async Task RefreshDoctorStatus(PiithDb db, Doctor doctor)
 {
-    var previousStatus = doctor.Status;
     var latestPoint = await db.PointRecords.Where(r => r.DoctorId == doctor.Id)
         .OrderByDescending(r => r.RecordedAt).FirstOrDefaultAsync();
     var presentAtHospital = latestPoint?.Action == "Entrada";
-    var attendingPatient = await db.PreFichas.AnyAsync(p => p.DoctorId == doctor.Id && p.Status == "Em atendimento");
-    doctor.Status = !presentAtHospital ? "Fora de serviço" : attendingPatient ? "Ocupado" : "Disponível";
+    var activeFicha = await db.PreFichas.AnyAsync(p => p.DoctorId == doctor.Id &&
+        (p.Status == "Encaminhado" || p.Status == "Em atendimento"));
+    var previousStatus = doctor.Status;
+    var hasRoomSignal = doctor.RoomPresenceUpdatedAt is not null;
+    var roomSignalFresh = doctor.RoomPresenceUpdatedAt is DateTime roomAt && roomAt >= DateTime.UtcNow.AddSeconds(-30);
+
+    if (!presentAtHospital) doctor.Status = "Fora de serviço";
+    else if (activeFicha) doctor.Status = "Ocupado";
+    else if (!hasRoomSignal) doctor.Status = "Disponível"; // compatibilidade com dados demonstrativos antigos
+    else if (!roomSignalFresh) doctor.Status = "Indeterminado";
+    else doctor.Status = doctor.RoomPresent == true ? "Disponível" : "Ausente da sala";
+
     if (doctor.Status == "Disponível" && previousStatus != "Disponível")
         doctor.LastReleasedAt = DateTime.UtcNow;
+}
+
+static bool ValidCameraToken(HttpRequest request, IConfiguration config)
+{
+    var expected = Environment.GetEnvironmentVariable("PIITH_CAMERA_TOKEN") ?? config["PIITH_CAMERA_TOKEN"];
+    return !string.IsNullOrWhiteSpace(expected) &&
+        string.Equals(request.Headers["X-Camera-Token"].ToString(), expected, StringComparison.Ordinal);
 }
 
 static string GetConnectionString(IConfiguration config)
@@ -381,6 +456,8 @@ namespace PIITH
         public string Specialty { get; set; } = "";
         public string Status { get; set; } = "Indeterminado";
         public DateTime LastReleasedAt { get; set; }
+        public bool? RoomPresent { get; set; }
+        public DateTime? RoomPresenceUpdatedAt { get; set; }
     }
     public class PointRecord
     {
@@ -396,4 +473,27 @@ namespace PIITH
     public record UpdatePriority(string Priority);
     public record AssignDoctor(int DoctorId);
     public record PointRequest(string Action);
+    public record CameraFrameRequest(int DoctorId, bool? MedicoPresente, string ImageBase64);
+
+    public static class CameraHub
+    {
+        private static readonly object Sync = new();
+        private static byte[]? _frame;
+        private static DateTime? _lastFrameAt;
+        public static bool HasFrame { get { lock (Sync) return _frame is not null; } }
+        public static DateTime? LastFrameAt { get { lock (Sync) return _lastFrameAt; } }
+        public static void SetFrame(byte[] frame)
+        {
+            lock (Sync) { _frame = frame; _lastFrameAt = DateTime.UtcNow; }
+        }
+        public static bool TryGetFrame(out byte[] frame, out DateTime? updatedAt)
+        {
+            lock (Sync)
+            {
+                frame = _frame ?? Array.Empty<byte>();
+                updatedAt = _lastFrameAt;
+                return _frame is not null;
+            }
+        }
+    }
 }
